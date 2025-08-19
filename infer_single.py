@@ -25,7 +25,8 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="./configs/inference/lam-20k-8gpu.yaml", help="Config file path")
     parser.add_argument("--model_path", type=str, default="/inspire/hdd/project/urbanlowaltitude/fengkairui-25026/wuyue/FastAvatar/model_zoo/lam_models/releases/lam/lam-20k/step_045500/model.safetensors", help="Model safetensors file path")
-    parser.add_argument("--data_dir", type=str, default="/inspire/hdd/project/urbanlowaltitude/fengkairui-25026/wuyue/nersemble_FLAME/sequence_EXP-5-mouth_part-4/247/cam_222200037", help="Input data directory")
+    parser.add_argument("--input_data_dir", type=str, required=True, help="Input sequence data directory")
+    parser.add_argument("--driving_data_dir", type=str, required=True, help="Driving sequence data directory")
     parser.add_argument("--output_dir", type=str, default="results", help="Output directory")
     parser.add_argument("--input_frame", type=int, default=0, help="Input frame number (0-based, default: 0 for first frame)")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cpu, cuda, cuda:0, cuda:1, etc.)")
@@ -221,7 +222,7 @@ def load_preprocessed_data(data_dir, quiet=False):
     }
 
 
-def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, device="auto", quiet=False, save_images=True, fps=30, save_video=False):
+def infer_and_save(config, model_path, input_data_dir, driving_data_dir, output_dir, input_frame=0, device="auto", quiet=False, save_images=True, fps=30, save_video=False):
     import torch._dynamo
     torch._dynamo.config.disable = True
     cfg = OmegaConf.load(config)
@@ -231,32 +232,51 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
     model = build_model(cfg, model_path, quiet).to(device)
     model.eval()
     
+    # Determine if this is cross-reenacted or self-reenacted
+    is_cross_reenacted = input_data_dir != driving_data_dir
+    
+    if is_cross_reenacted:
+        if not quiet:
+            print("Running cross-reenacted inference...")
+            print(f"Input sequence: {input_data_dir}")
+            print(f"Driving sequence: {driving_data_dir}")
+    else:
+        if not quiet:
+            print("Running self-reenacted inference...")
+            print(f"Data directory: {input_data_dir}")
+    
+    # Load input sequence data
     if not quiet:
-        print("Loading data...")
-    data = load_preprocessed_data(data_dir, quiet)
-
-    # Check if input frame is valid
-    num_frames = data['rgbs'].shape[1]
-    if input_frame >= num_frames:
-        raise ValueError(f"Input frame {input_frame} is out of range. Available frames: 0-{num_frames-1}")
+        print("Loading input sequence data...")
+    input_data = load_preprocessed_data(input_data_dir, quiet)
+    
+    # Load driving sequence data
+    if not quiet:
+        print("Loading driving sequence data...")
+    driving_data = load_preprocessed_data(driving_data_dir, quiet)
+    
+    # Check if input frame is valid for input sequence
+    input_num_frames = input_data['rgbs'].shape[1]
+    if input_frame >= input_num_frames:
+        raise ValueError(f"Input frame {input_frame} is out of range for input sequence. Available frames: 0-{input_num_frames-1}")
     
     if not quiet:
-        print(f"Using frame {input_frame} as input (0-based index)")
-
-    # Use specified frame as input
-    input_image = data['rgbs'][:, input_frame:input_frame+1].to(device)  # [1, 1, 3, H, W]
-    input_c2ws = data['c2ws'][:, input_frame:input_frame+1].to(device)   # [1, 1, 4, 4]
-    input_intrs = data['intrs'][:, input_frame:input_frame+1].to(device) # [1, 1, 4, 4]
+        print(f"Using frame {input_frame} from input sequence as input (0-based index)")
+    
+    # Use specified frame from input sequence as input
+    input_image = input_data['rgbs'][:, input_frame:input_frame+1].to(device)  # [1, 1, 3, H, W]
+    input_c2ws = input_data['c2ws'][:, input_frame:input_frame+1].to(device)   # [1, 1, 4, 4]
+    input_intrs = input_data['intrs'][:, input_frame:input_frame+1].to(device) # [1, 1, 4, 4]
     # Set input background colors to white [1, 1, 1]
-    input_bg_colors = torch.ones_like(data['bg_colors'][:, input_frame:input_frame+1].to(device))  # White background
-    input_flame_params = {k: v[:, input_frame:input_frame+1].to(device) for k, v in data['flame_params'].items()}
-
-    # Use all frames as target for rendering with white background
-    target_c2ws = data['c2ws'].to(device)
-    target_intrs = data['intrs'].to(device)
+    input_bg_colors = torch.ones_like(input_data['bg_colors'][:, input_frame:input_frame+1].to(device))  # White background
+    input_flame_params = {k: v[:, input_frame:input_frame+1].to(device) for k, v in input_data['flame_params'].items()}
+    
+    # Use all frames from driving sequence as target for rendering with white background
+    target_c2ws = driving_data['c2ws'].to(device)
+    target_intrs = driving_data['intrs'].to(device)
     # Set background colors to white [1, 1, 1]
-    target_bg_colors = torch.ones_like(data['bg_colors'].to(device))  # White background
-    target_flame_params = {k: v.to(device) for k, v in data['flame_params'].items()}
+    target_bg_colors = torch.ones_like(driving_data['bg_colors'].to(device))  # White background
+    target_flame_params = {k: v.to(device) for k, v in driving_data['flame_params'].items()}
 
     import time
     start_time = time.time()
@@ -275,6 +295,7 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
     total_time = end_time - start_time
     if not quiet:
         print(f"\n=== Inference Summary ===")
+        print(f"Mode: {'Cross-reenacted' if is_cross_reenacted else 'Self-reenacted'}")
         print(f"Input frame: {input_frame}")
         print(f"Output frames: {target_c2ws.shape[1]}")
         print(f"Total inference time: {total_time:.2f} seconds")
@@ -297,9 +318,9 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
             print(f"Pred_rgb shape: {pred_rgb.shape}")
             print(f"Results numpy shape: {results.shape}")
         
-        # Get masks for background replacement
-        if 'masks' in data:
-            masks = data['masks'].detach().cpu().numpy()
+        # Get masks for background replacement from driving dataset
+        if 'masks' in driving_data:
+            masks = driving_data['masks'].detach().cpu().numpy()
         else:
             # Create dummy masks if not available
             masks = np.ones((1, results.shape[1], 1, results.shape[-2], results.shape[-1]))
@@ -310,8 +331,8 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
         H, W = masks.shape[-2], masks.shape[-1]
         gt_results_white = np.zeros((1, num_frames, 3, H, W), dtype=np.float32)
         
-        # Load transforms.json to get original image paths
-        transforms_json = os.path.join(data_dir, "transforms.json")
+        # Load transforms.json to get original image paths from driving dataset
+        transforms_json = os.path.join(driving_data_dir, "transforms.json")
         if os.path.exists(transforms_json):
             with open(transforms_json, 'r') as f:
                 transforms_data = json.load(f)
@@ -323,7 +344,7 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
                 # Get original image path from transforms.json
                 if i < len(transforms_data['frames']):
                     frame_info = transforms_data['frames'][i]
-                    original_image_path = os.path.join(data_dir, frame_info['file_path'])
+                    original_image_path = os.path.join(driving_data_dir, frame_info['file_path'])
                     
                     if os.path.exists(original_image_path):
                         # Load original RGB image
@@ -351,21 +372,21 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
                         gt_results_white[0, i] = rgb_frame_white.transpose(2, 0, 1)
                     else:
                         # Fallback: use the processed data but apply white background
-                        gt_results = data['rgbs'].detach().cpu().numpy()
+                        gt_results = driving_data['rgbs'].detach().cpu().numpy()
                         mask_2d = masks[0, i, 0]  # Shape: (H, W)
                         gt_frame = gt_results[0, i].transpose(1, 2, 0)  # Shape: (H, W, 3)
                         gt_frame_white = gt_frame * mask_2d[:, :, None] + (1 - mask_2d[:, :, None]) * 1.0
                         gt_results_white[0, i] = gt_frame_white.transpose(2, 0, 1)
                 else:
                     # Fallback: use the processed data but apply white background
-                    gt_results = data['rgbs'].detach().cpu().numpy()
+                    gt_results = driving_data['rgbs'].detach().cpu().numpy()
                     mask_2d = masks[0, i, 0]  # Shape: (H, W)
                     gt_frame = gt_results[0, i].transpose(1, 2, 0)  # Shape: (H, W, 3)
                     gt_frame_white = gt_frame * mask_2d[:, :, None] + (1 - mask_2d[:, :, None]) * 1.0
                     gt_results_white[0, i] = gt_frame_white.transpose(2, 0, 1)
         else:
             # Fallback: use the processed data but apply white background
-            gt_results = data['rgbs'].detach().cpu().numpy()
+            gt_results = driving_data['rgbs'].detach().cpu().numpy()
             num_frames = masks.shape[1]
             for i in range(num_frames):
                 mask_2d = masks[0, i, 0]  # Shape: (H, W)
@@ -373,14 +394,47 @@ def infer_and_save(config, model_path, data_dir, output_dir, input_frame=0, devi
                 gt_frame_white = gt_frame * mask_2d[:, :, None] + (1 - mask_2d[:, :, None]) * 1.0
                 gt_results_white[0, i] = gt_frame_white.transpose(2, 0, 1)
         
-        save_results(results, gt_results_white, masks, output_dir, quiet, fps, save_video)
+        # Prepare driver video for saving
+        driver_video = None
+        if save_video:
+            # Convert driving data to video format
+            driver_rgbs = driving_data['rgbs'].detach().cpu().numpy()
+            driver_masks = driving_data['masks'].detach().cpu().numpy()
+            
+            # Apply white background to driving videos
+            num_frames = driver_rgbs.shape[1]
+            H, W = driver_rgbs.shape[-2], driver_rgbs.shape[-1]
+            driver_video_white = np.zeros((num_frames, 3, H, W), dtype=np.float32)
+            
+            for i in range(num_frames):
+                mask_2d = driver_masks[0, i, 0]  # Shape: (H, W)
+                driver_frame = driver_rgbs[0, i].transpose(1, 2, 0)  # Shape: (H, W, 3)
+                driver_frame_white = driver_frame * mask_2d[:, :, None] + (1 - mask_2d[:, :, None]) * 1.0
+                driver_video_white[i] = driver_frame_white.transpose(2, 0, 1)
+            
+            # Convert to uint8 and prepare for video
+            driver_video_uint8 = (np.clip(driver_video_white, 0, 1.0) * 255).astype(np.uint8)
+            driver_video = []
+            for i in range(driver_video_uint8.shape[0]):
+                driver_frame = driver_video_uint8[i]  # Shape: (3, H, W)
+                if driver_frame.shape[0] == 3:  # RGB
+                    driver_frame = np.transpose(driver_frame, (1, 2, 0))  # Shape: (H, W, 3)
+                driver_video.append(driver_frame)
+            
+            # Save results with driver video
+            save_results(results, gt_results_white, masks, output_dir, quiet, fps, save_video, driver_video)
+        else:
+            # Save results without driver video
+            save_results(results, gt_results_white, masks, output_dir, quiet, fps, save_video)
     
     return {
         'inference_time': total_time,
         'fps': target_c2ws.shape[1]/total_time,
         'num_frames': target_c2ws.shape[1],
         'input_frame': input_frame,
-        'data_path': data_dir,
+        'input_data_dir': input_data_dir,
+        'driving_data_dir': driving_data_dir,
+        'mode': 'cross-reenacted' if is_cross_reenacted else 'self-reenacted'
     }
 
 
@@ -438,7 +492,7 @@ def get_device(device_str, quiet=False):
         return torch.device('cpu')
 
 
-def save_results(results, gt_results, masks, output_dir, quiet=False, fps=30, save_video=False):
+def save_results(results, gt_results, masks, output_dir, quiet=False, fps=30, save_video=False, driver_video=None):
     """Save inference results and ground truth as images and videos with white backgrounds using masks."""
     os.makedirs(output_dir, exist_ok=True)
     
@@ -539,6 +593,14 @@ def save_results(results, gt_results, masks, output_dir, quiet=False, fps=30, sa
             if not quiet:
                 print(f"Saved prediction video to: {pred_video_path}")
                 print(f"Saved ground truth video to: {gt_video_path}")
+            
+            # Save driver video if provided
+            if driver_video is not None:
+                driver_video_path = os.path.join(output_dir, "driver.mp4")
+                driver_clip = ImageSequenceClip(driver_video, fps=fps)
+                driver_clip.write_videofile(driver_video_path, fps=fps, verbose=False, logger=None)
+                if not quiet:
+                    print(f"Saved driver video to: {driver_video_path}")
                 
         except Exception as e:
             if not quiet:
@@ -548,10 +610,12 @@ def save_results(results, gt_results, masks, output_dir, quiet=False, fps=30, sa
 
 def main():
     args = parse_args()
+    
     results = infer_and_save(
         config=args.config,
         model_path=args.model_path,
-        data_dir=args.data_dir,
+        input_data_dir=args.input_data_dir,
+        driving_data_dir=args.driving_data_dir,
         output_dir=args.output_dir,
         input_frame=args.input_frame,
         device=args.device,
@@ -560,7 +624,12 @@ def main():
         save_video=args.save_video
     )
     print("\n=== Inference Results ===")
-    print(f"Data directory: {args.data_dir}")
+    print(f"Mode: {results['mode']}")
+    if results['mode'] == 'cross-reenacted':
+        print(f"Input sequence: {args.input_data_dir}")
+        print(f"Driving sequence: {args.driving_data_dir}")
+    else:
+        print(f"Data directory: {args.input_data_dir}")
     print(f"Input frame: {args.input_frame}")
     print(f"Output frames: {results['num_frames']}")
     print(f"Inference time: {results['inference_time']:.2f} seconds")
